@@ -21,17 +21,44 @@ extension MySQLDatabase {
         }, onMetadata: onMetadata).map { rows }
     }
     
+    /// Rows grouped per result set — see `simpleQueryResultSets(_:)` for
+    /// why the boundaries have to be reported while reading rather than
+    /// inferred afterwards.
+    public func queryResultSets(
+        _ sql: String,
+        _ binds: [MySQLData] = [],
+        onMetadata: @escaping (MySQLQueryMetadata) throws -> () = { _ in }
+    ) -> EventLoopFuture<[[MySQLRow]]> {
+        nonisolated(unsafe) var resultSets: [[MySQLRow]] = [[]]
+        return self.query(sql, binds, onRow: { row in
+            resultSets[resultSets.count - 1].append(row)
+        }, onMetadata: onMetadata, onResultSetBoundary: {
+            resultSets.append([])
+        }).map { resultSets.filter { !$0.isEmpty } }
+    }
+
     public func query(
         _ sql: String,
         _ binds: [MySQLData] = [],
         onRow: @escaping (MySQLRow) throws -> (),
         onMetadata: @escaping (MySQLQueryMetadata) throws -> () = { _ in }
     ) -> EventLoopFuture<Void> {
+        self.query(sql, binds, onRow: onRow, onMetadata: onMetadata, onResultSetBoundary: {})
+    }
+
+    public func query(
+        _ sql: String,
+        _ binds: [MySQLData] = [],
+        onRow: @escaping (MySQLRow) throws -> (),
+        onMetadata: @escaping (MySQLQueryMetadata) throws -> () = { _ in },
+        onResultSetBoundary: @escaping () -> ()
+    ) -> EventLoopFuture<Void> {
         let query = MySQLQueryCommand(
             sql: sql,
             binds: binds,
             onRow: onRow,
             onMetadata: onMetadata,
+            onResultSetBoundary: onResultSetBoundary,
             logger: self.logger
         )
         return self.send(query, logger: self.logger)
@@ -55,6 +82,7 @@ private final class MySQLQueryCommand: MySQLCommand, @unchecked Sendable { // th
     let binds: [MySQLData]
     let onRow: (MySQLRow) throws -> ()
     let onMetadata: (MySQLQueryMetadata) throws -> ()
+    let onResultSetBoundary: () -> ()
     let logger: Logger
 
     private var prepareColumns: [MySQLProtocol.ColumnDefinition41]
@@ -70,6 +98,7 @@ private final class MySQLQueryCommand: MySQLCommand, @unchecked Sendable { // th
         binds: [MySQLData],
         onRow: @escaping (MySQLRow) throws -> (),
         onMetadata: @escaping (MySQLQueryMetadata) throws -> (),
+        onResultSetBoundary: @escaping () -> () = {},
         logger: Logger
     ) {
         self.state = .ready
@@ -80,6 +109,7 @@ private final class MySQLQueryCommand: MySQLCommand, @unchecked Sendable { // th
         self.params = []
         self.onRow = onRow
         self.onMetadata = onMetadata
+        self.onResultSetBoundary = onResultSetBoundary
         self.logger = logger
     }
     
@@ -186,6 +216,7 @@ private final class MySQLQueryCommand: MySQLCommand, @unchecked Sendable { // th
                 let hasMoreResults = (try? MySQLProtocol.OK_Packet.decode(from: &terminator, capabilities: capabilities))?
                     .statusFlags.contains(.SERVER_MORE_RESULTS_EXISTS) ?? false
                 if hasMoreResults {
+                    self.onResultSetBoundary()
                     self.executeColumns = []
                     self.state = .executeColumnCount
                     return .noResponse
