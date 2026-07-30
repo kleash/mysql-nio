@@ -69,7 +69,20 @@ private final class MySQLSimpleQueryCommand: MySQLCommand, @unchecked Sendable {
             }
             return .noResponse
         case .rows:
-            guard !packet.isEOF else {
+            if packet.isEOF {
+                // With CLIENT_MULTI_RESULTS a `CALL` that returns result
+                // sets terminates each one with SERVER_MORE_RESULTS_EXISTS
+                // set; without consuming those follow-up result sets the
+                // connection desyncs (the next command hangs waiting for a
+                // reply that's already been overtaken by leftover packets).
+                var terminator = packet
+                let hasMoreResults = (try? MySQLProtocol.OK_Packet.decode(from: &terminator, capabilities: capabilities))?
+                    .statusFlags.contains(.SERVER_MORE_RESULTS_EXISTS) ?? false
+                if hasMoreResults {
+                    self.columns = []
+                    self.state = .ready
+                    return .noResponse
+                }
                 self.state = .done
                 return .done
             }

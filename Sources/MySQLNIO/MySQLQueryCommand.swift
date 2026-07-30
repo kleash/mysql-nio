@@ -177,6 +177,19 @@ private final class MySQLQueryCommand: MySQLCommand, @unchecked Sendable { // th
             return .noResponse
         case .rows:
             if packet.isEOF || packet.isOK && executeColumns.count == 0 {
+                // See the matching comment in `MySQLSimpleQueryCommand`:
+                // a result-set-returning `CALL` sends several result sets
+                // back to back, and `done(packet:capabilities:)` would both
+                // stop reading early *and* send COM_STMT_CLOSE while those
+                // packets are still in flight.
+                var terminator = packet
+                let hasMoreResults = (try? MySQLProtocol.OK_Packet.decode(from: &terminator, capabilities: capabilities))?
+                    .statusFlags.contains(.SERVER_MORE_RESULTS_EXISTS) ?? false
+                if hasMoreResults {
+                    self.executeColumns = []
+                    self.state = .executeColumnCount
+                    return .noResponse
+                }
                 return try self.done(packet: &packet, capabilities: capabilities)
             }
 
