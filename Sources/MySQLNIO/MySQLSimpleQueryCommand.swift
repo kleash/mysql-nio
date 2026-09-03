@@ -8,17 +8,36 @@ extension MySQLDatabase {
         }.map { rows }
     }
     
-    /// Rows grouped per result set. A `CALL` to a stored procedure can
-    /// return several, and a caller can't recover the boundaries from the
-    /// rows alone — two result sets may have identical column shapes — so
-    /// they have to be reported while reading.
-    public func simpleQueryResultSets(_ sql: String) -> EventLoopFuture<[[MySQLRow]]> {
-        nonisolated(unsafe) var resultSets: [[MySQLRow]] = [[]]
+    /// Result sets, each carrying its own columns. A `CALL` to a stored
+    /// procedure can return several, and a caller can't recover the
+    /// boundaries from the rows alone — two result sets may have identical
+    /// column shapes — so they have to be reported while reading.
+    ///
+    /// A result set is recorded as soon as the server announces its
+    /// columns, so a `SELECT` that matched nothing still comes back (with
+    /// its columns and no rows) instead of vanishing. Statements that
+    /// return no result set at all — `INSERT`, `USE`, DDL — never announce
+    /// columns and so contribute no entry.
+    public func simpleQueryResultSets(_ sql: String) -> EventLoopFuture<[MySQLResultSet]> {
+        nonisolated(unsafe) var resultSets: [MySQLResultSet] = []
+        nonisolated(unsafe) var columns: [MySQLProtocol.ColumnDefinition41] = []
+        nonisolated(unsafe) var rows: [MySQLRow] = []
         return self.simpleQuery(sql, onRow: { row in
-            resultSets[resultSets.count - 1].append(row)
+            rows.append(row)
         }, onResultSetBoundary: {
-            resultSets.append([])
-        }).map { resultSets.filter { !$0.isEmpty } }
+            resultSets.append(.init(columns: columns, rows: rows))
+            columns = []
+            rows = []
+        }, onResultSetColumns: { announced in
+            columns = announced
+        }).map {
+            // The last result set has no boundary after it — the command
+            // finishing is what closes it.
+            if !columns.isEmpty || !rows.isEmpty {
+                resultSets.append(.init(columns: columns, rows: rows))
+            }
+            return resultSets
+        }
     }
 
     public func simpleQuery(_ sql: String, onRow: @escaping (MySQLRow) -> ()) -> EventLoopFuture<Void> {
@@ -28,9 +47,15 @@ extension MySQLDatabase {
     public func simpleQuery(
         _ sql: String,
         onRow: @escaping (MySQLRow) -> (),
-        onResultSetBoundary: @escaping () -> ()
+        onResultSetBoundary: @escaping () -> (),
+        onResultSetColumns: @escaping ([MySQLProtocol.ColumnDefinition41]) -> () = { _ in }
     ) -> EventLoopFuture<Void> {
-        let query = MySQLSimpleQueryCommand(sql: sql, onRow: onRow, onResultSetBoundary: onResultSetBoundary)
+        let query = MySQLSimpleQueryCommand(
+            sql: sql,
+            onRow: onRow,
+            onResultSetBoundary: onResultSetBoundary,
+            onResultSetColumns: onResultSetColumns
+        )
         return self.send(query, logger: self.logger)
     }
 }
@@ -49,13 +74,20 @@ private final class MySQLSimpleQueryCommand: MySQLCommand, @unchecked Sendable {
     var columns: [MySQLProtocol.ColumnDefinition41]
     let onRow: (MySQLRow) -> ()
     let onResultSetBoundary: () -> ()
-    
-    init(sql: String, onRow: @escaping (MySQLRow) -> (), onResultSetBoundary: @escaping () -> () = {}) {
+    let onResultSetColumns: ([MySQLProtocol.ColumnDefinition41]) -> ()
+
+    init(
+        sql: String,
+        onRow: @escaping (MySQLRow) -> (),
+        onResultSetBoundary: @escaping () -> () = {},
+        onResultSetColumns: @escaping ([MySQLProtocol.ColumnDefinition41]) -> () = { _ in }
+    ) {
         self.state = .ready
         self.sql = sql
         self.columns = []
         self.onRow = onRow
         self.onResultSetBoundary = onResultSetBoundary
+        self.onResultSetColumns = onResultSetColumns
     }
     
     func handle(packet: inout MySQLPacket, capabilities: MySQLProtocol.CapabilityFlags) throws -> MySQLCommandState {
@@ -88,6 +120,11 @@ private final class MySQLSimpleQueryCommand: MySQLCommand, @unchecked Sendable {
             let column = try packet.decode(MySQLProtocol.ColumnDefinition41.self, capabilities: capabilities)
             self.columns.append(column)
             if self.columns.count == numericCast(total) {
+                // The server has finished describing this result set.
+                // Reporting it here — before any row arrives — is what lets
+                // a caller record a result set that turns out to have no
+                // rows at all.
+                self.onResultSetColumns(self.columns)
                 self.state = .rows
             }
             return .noResponse

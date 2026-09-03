@@ -21,20 +21,39 @@ extension MySQLDatabase {
         }, onMetadata: onMetadata).map { rows }
     }
     
-    /// Rows grouped per result set — see `simpleQueryResultSets(_:)` for
-    /// why the boundaries have to be reported while reading rather than
-    /// inferred afterwards.
+    /// Result sets, each carrying its own columns — see
+    /// `simpleQueryResultSets(_:)` for why the boundaries have to be
+    /// reported while reading rather than inferred afterwards.
+    ///
+    /// A result set is recorded as soon as the server announces its
+    /// columns, so a `SELECT` that matched nothing still comes back (with
+    /// its columns and no rows) instead of vanishing. Statements that
+    /// return no result set at all — `INSERT`, `USE`, DDL — never announce
+    /// columns and so contribute no entry.
     public func queryResultSets(
         _ sql: String,
         _ binds: [MySQLData] = [],
         onMetadata: @escaping (MySQLQueryMetadata) throws -> () = { _ in }
-    ) -> EventLoopFuture<[[MySQLRow]]> {
-        nonisolated(unsafe) var resultSets: [[MySQLRow]] = [[]]
+    ) -> EventLoopFuture<[MySQLResultSet]> {
+        nonisolated(unsafe) var resultSets: [MySQLResultSet] = []
+        nonisolated(unsafe) var columns: [MySQLProtocol.ColumnDefinition41] = []
+        nonisolated(unsafe) var rows: [MySQLRow] = []
         return self.query(sql, binds, onRow: { row in
-            resultSets[resultSets.count - 1].append(row)
+            rows.append(row)
         }, onMetadata: onMetadata, onResultSetBoundary: {
-            resultSets.append([])
-        }).map { resultSets.filter { !$0.isEmpty } }
+            resultSets.append(.init(columns: columns, rows: rows))
+            columns = []
+            rows = []
+        }, onResultSetColumns: { announced in
+            columns = announced
+        }).map {
+            // The last result set has no boundary after it — the command
+            // finishing is what closes it.
+            if !columns.isEmpty || !rows.isEmpty {
+                resultSets.append(.init(columns: columns, rows: rows))
+            }
+            return resultSets
+        }
     }
 
     public func query(
@@ -51,7 +70,8 @@ extension MySQLDatabase {
         _ binds: [MySQLData] = [],
         onRow: @escaping (MySQLRow) throws -> (),
         onMetadata: @escaping (MySQLQueryMetadata) throws -> () = { _ in },
-        onResultSetBoundary: @escaping () -> ()
+        onResultSetBoundary: @escaping () -> (),
+        onResultSetColumns: @escaping ([MySQLProtocol.ColumnDefinition41]) -> () = { _ in }
     ) -> EventLoopFuture<Void> {
         let query = MySQLQueryCommand(
             sql: sql,
@@ -59,6 +79,7 @@ extension MySQLDatabase {
             onRow: onRow,
             onMetadata: onMetadata,
             onResultSetBoundary: onResultSetBoundary,
+            onResultSetColumns: onResultSetColumns,
             logger: self.logger
         )
         return self.send(query, logger: self.logger)
@@ -83,6 +104,7 @@ private final class MySQLQueryCommand: MySQLCommand, @unchecked Sendable { // th
     let onRow: (MySQLRow) throws -> ()
     let onMetadata: (MySQLQueryMetadata) throws -> ()
     let onResultSetBoundary: () -> ()
+    let onResultSetColumns: ([MySQLProtocol.ColumnDefinition41]) -> ()
     let logger: Logger
 
     private var prepareColumns: [MySQLProtocol.ColumnDefinition41]
@@ -99,6 +121,7 @@ private final class MySQLQueryCommand: MySQLCommand, @unchecked Sendable { // th
         onRow: @escaping (MySQLRow) throws -> (),
         onMetadata: @escaping (MySQLQueryMetadata) throws -> (),
         onResultSetBoundary: @escaping () -> () = {},
+        onResultSetColumns: @escaping ([MySQLProtocol.ColumnDefinition41]) -> () = { _ in },
         logger: Logger
     ) {
         self.state = .ready
@@ -110,6 +133,7 @@ private final class MySQLQueryCommand: MySQLCommand, @unchecked Sendable { // th
         self.onRow = onRow
         self.onMetadata = onMetadata
         self.onResultSetBoundary = onResultSetBoundary
+        self.onResultSetColumns = onResultSetColumns
         self.logger = logger
     }
     
@@ -200,6 +224,11 @@ private final class MySQLQueryCommand: MySQLCommand, @unchecked Sendable { // th
             remaining -= 1
             switch remaining {
             case 0:
+                // The server has finished describing this result set.
+                // Reporting it here — before any row arrives — is what lets
+                // a caller record a result set that turns out to have no
+                // rows at all.
+                self.onResultSetColumns(self.executeColumns)
                 self.state = .rows
             default:
                 self.state = .executeColumns(remaining: remaining)
