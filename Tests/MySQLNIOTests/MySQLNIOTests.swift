@@ -459,6 +459,38 @@ struct MySQLNIOTests {
         #expect(bytes.readableBytes == 0 || bytes.readableBytesView.elementsEqual([0x01, 0x00, 0x00, 0x00, 0x01]), "the server got more than a COM_QUIT: \(bytes.hexDump(format: .plain))") // no login
         try? await serverChannel.close(mode: .all)
     }
+
+    @Test
+    func packetEncoder_splitsLargePayloads() throws {
+        // A payload of 0xFFFFFF bytes or more goes out as 0xFFFFFF-byte packets, each with its own header and sequence number,
+        // and then a shorter one, which is empty when the payload is exactly 0xFFFFFF bytes.
+        let encoder = MySQLPacketEncoder(sequence: .init(), logger: .init(label: "") { _ in SwiftLogNoOpLogHandler() })
+        for (size, rest) in [(0xFF_FF_FF + 10, 10), (0xFF_FF_FF, 0)] {
+            encoder.sequence.reset()
+            var out = ByteBuffer()
+            try encoder.encode(data: MySQLPacket(payload: ByteBuffer(repeating: 0x61, count: size)), out: &out)
+            #expect(out.readableBytes == size + 8)
+            #expect(out.getBytes(at: 0, length: 4) == [0xFF, 0xFF, 0xFF, 0x00])
+            #expect(out.getBytes(at: 4 + 0xFF_FF_FF, length: 4) == [UInt8(rest), 0x00, 0x00, 0x01])
+        }
+    }
+
+    @Test
+    func simpleQuery_statementLargerThanOnePacket() async throws {
+        let conn = try await MySQLConnection.test()
+
+        do {
+            // The server must get all 16 MiB: it either runs the statement or, past its max_allowed_packet, refuses all of it.
+            let rows = try await conn.simpleQuery("SELECT LENGTH('\(String(repeating: "a", count: 1 << 24))') AS n").get()
+            #expect(rows.first?.column("n")?.int == 1 << 24)
+        } catch MySQLError.server(let error) where error.errorCode == .NET_PACKET_TOO_LARGE {
+            // Refused whole: nothing ran.
+        } catch {
+            try? await conn.close().get()
+            throw error
+        }
+        try? await conn.close().get()
+    }
 }
 
 final class MySQLNIOXCTests: XCTestCase {
