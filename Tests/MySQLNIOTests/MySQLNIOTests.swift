@@ -1,6 +1,7 @@
 import Logging
 @testable import MySQLNIO
 import NIOCore
+import NIOEmbedded
 import NIOPosix
 import Testing
 import XCTest
@@ -490,6 +491,55 @@ struct MySQLNIOTests {
             throw error
         }
         try? await conn.close().get()
+    }
+
+    @Test
+    func packetDecoder_joinsLargePayloads() throws {
+        // A text row whose first value is 16 MiB starts with 0xFE, like the packet that ends a result set, and must not pass for one.
+        var row = ByteBuffer(bytes: [0xFE])
+        row.writeInteger(UInt64(1 << 24), endianness: .little)
+        row.writeRepeatingByte(0x61, count: 1 << 24)
+        for (payload, lastSequenceID) in [(row, 1), (ByteBuffer(repeating: 0x61, count: 0xFF_FF_FF), 1), (ByteBuffer(repeating: 0x62, count: 2 * 0xFF_FF_FF + 5), 2)] as [(ByteBuffer, UInt8)] {
+            let sequence = MySQLPacketSequence()
+            let channel = EmbeddedChannel(handler: ByteToMessageHandler(MySQLPacketDecoder(sequence: sequence, logger: .init(label: "") { _ in SwiftLogNoOpLogHandler() })))
+            var frames = ByteBuffer()
+            try MySQLPacketEncoder(sequence: .init(), logger: .init(label: "") { _ in SwiftLogNoOpLogHandler() }).encode(data: MySQLPacket(payload: payload), out: &frames)
+            try channel.writeInbound(frames.readSlice(length: 4 + 0xFF_FF_FF + 2)!) // up to the middle of the second packet's header
+            #expect(try channel.readInbound(as: MySQLPacket.self) == nil)
+            try channel.writeInbound(frames)
+            let packet = try #require(try channel.readInbound(as: MySQLPacket.self))
+            #expect(packet.payload == payload)
+            #expect(!packet.isEOF)
+            #expect(sequence.current == lastSequenceID)
+            _ = try channel.finish()
+        }
+        #expect(MySQLPacket(payload: ByteBuffer(bytes: [0xFE, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00])).isEOF) // OK packet ending a result set
+    }
+
+    @Test
+    func query_rowLargerThanOnePacket() async throws {
+        let conn = try await MySQLConnection.test()
+
+        do {
+            // A server can only make a 16 MiB value if max_allowed_packet allows it (MySQL 5.7 defaults to 4 MiB).
+            if try await conn.simpleQuery("SELECT @@max_allowed_packet >= 16777216 AS fits").get().first?.column("fits")?.int == 1 {
+                _ = try await conn.simpleQuery("DROP TABLE IF EXISTS foos").get()
+                _ = try await conn.simpleQuery("CREATE TABLE foos (b LONGBLOB, id INT PRIMARY KEY)").get()
+                _ = try await conn.simpleQuery("INSERT INTO foos VALUES ('one', 1), (REPEAT('a', 16777216), 2), ('three', 3)").get()
+                func check(_ rows: [MySQLRow]) {
+                    #expect(rows.map { $0.column("id")?.int } == [1, 2, 3])
+                    #expect(rows.map { $0.column("b")?.buffer } == [ByteBuffer(string: "one"), ByteBuffer(repeating: 0x61, count: 1 << 24), ByteBuffer(string: "three")])
+                }
+                check(try await conn.simpleQuery("SELECT b, id FROM foos ORDER BY id").get())
+                check(try await conn.query("SELECT b, id FROM foos ORDER BY id").get())
+                _ = try await conn.simpleQuery("DROP TABLE IF EXISTS foos").get()
+            }
+        } catch {
+            _ = try? await conn.simpleQuery("DROP TABLE IF EXISTS foos").get()
+            try? await conn.close().get()
+            throw error
+        }
+        try await conn.close().get()
     }
 }
 

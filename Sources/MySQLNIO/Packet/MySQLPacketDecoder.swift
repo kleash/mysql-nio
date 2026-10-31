@@ -6,6 +6,9 @@ public struct MySQLPacketDecoder: ByteToMessageDecoder {
 
     public let sequence: MySQLPacketSequence
     let logger: Logger
+    /// The 0xFFFFFF-byte packets so far of a payload that doesn't fit in one; a shorter packet ends it.
+    // shortcut: a joined payload has no size limit (one packet used to stop at 16 MiB); cap it if servers can't be trusted with memory.
+    var fragments: ByteBuffer?
     
     public init(sequence: MySQLPacketSequence, logger: Logger) {
         self.sequence = sequence
@@ -22,13 +25,21 @@ public struct MySQLPacketDecoder: ByteToMessageDecoder {
         let length = header & 0x00_FF_FF_FF
         let sequenceID = header >> 24
         // print("header: \(header) length: \(length) seq: \(sequenceID)")
-        guard let payload = copy.readSlice(length: numericCast(length)) else {
+        guard var payload = copy.readSlice(length: numericCast(length)) else {
             return .needMoreData
         }
         buffer = copy
+        self.sequence.current = UInt8(sequenceID & 0xFF)
+        if var fragments = self.fragments.take() {
+            fragments.writeBuffer(&payload)
+            payload = fragments
+        }
+        guard length < 0xFF_FF_FF else {
+            self.fragments = payload
+            return .continue
+        }
         let packet = MySQLPacket(payload: payload)
         self.logger.trace("MySQLPacketDecoder.decode: \(packet)")
-        self.sequence.current = UInt8(sequenceID & 0xFF)
         context.fireChannelRead(self.wrapInboundOut(packet))
         return .continue
     }
