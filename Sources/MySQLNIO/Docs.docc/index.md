@@ -87,7 +87,7 @@ There are a few ways to create a `SocketAddress`:
 
 There are also some additional arguments you can supply to ``MySQLConnection/connect(to:username:database:password:tlsConfiguration:serverHostname:logger:on:)``. 
 
-- `tlsConfiguration` An optional `TLSConfiguration` struct. This will be used if the MySQL server supports TLS. Pass `nil` to opt-out of TLS.
+- `tlsConfiguration` An optional `TLSConfiguration` struct. If the MySQL server doesn't support TLS, the connection fails with ``MySQLError/secureConnectionRequired`` before any credentials are sent. Pass `nil` to opt-out of TLS.
 - `serverHostname` An optional `String` to use in conjunction with `tlsConfiguration` to specify the server's hostname. 
 
 ``MySQLConnection/connect(to:username:database:password:tlsConfiguration:serverHostname:logger:on:)`` will return a ``MySQLConnection``, or an error if it could not connect.

@@ -401,6 +401,64 @@ struct MySQLNIOTests {
         }
         try? await serverChannel.close(mode: .all)
     }
+
+    @Test
+    func tlsNotOfferedByServer() async throws {
+        // The greeting comes before TLS can start, so anyone on the path can remove CLIENT_SSL from it. A client that asked for TLS must
+        // then give up before sending its login, not send it in plaintext. A mock server records everything the client sends.
+        let received = MultiThreadedEventLoopGroup.singleton.any().makePromise(of: ByteBuffer.self)
+        let serverChannel = try await ServerBootstrap(group: .singletonMultiThreadedEventLoopGroup)
+            .childChannelInitializer { channel in
+                final class Handler: ChannelInboundHandler {
+                    typealias InboundIn = ByteBuffer; typealias OutboundOut = ByteBuffer
+                    let received: EventLoopPromise<ByteBuffer>
+                    var bytes = ByteBuffer()
+                    init(received: EventLoopPromise<ByteBuffer>) { self.received = received }
+                    func channelActive(context: ChannelHandlerContext) {
+                        let capabilities: MySQLProtocol.CapabilityFlags = [.CLIENT_LONG_PASSWORD, .CLIENT_PROTOCOL_41, .CLIENT_SECURE_CONNECTION, .CLIENT_PLUGIN_AUTH] // no CLIENT_SSL
+                        var packet = MySQLPacket()
+                        packet.payload.writeInteger(10, as: UInt8.self) // protocol version
+                        packet.payload.writeString("8.0.40\0")
+                        packet.payload.writeMultipleIntegers(
+                            1/*connection id*/, 0x6161_6161_6161_6161/*salt, part 1*/, 0/*filler*/, UInt16(truncatingIfNeeded: capabilities.rawValue),
+                            45/*utf8mb4_general_ci*/, 0x0002/*SERVER_STATUS_AUTOCOMMIT*/, UInt16(truncatingIfNeeded: capabilities.rawValue >> 16), 21/*salt length*/,
+                            endianness: .little, as: (UInt32, UInt64, UInt8, UInt16, UInt8, UInt16, UInt16, UInt8).self
+                        )
+                        packet.payload.writeRepeatingByte(0, count: 10) // reserved
+                        packet.payload.writeRepeatingByte(0x62, count: 12) // salt, part 2
+                        packet.payload.writeInteger(0, as: UInt8.self)
+                        packet.payload.writeString("mysql_native_password\0")
+                        self.send(packet, context: context)
+                    }
+                    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+                        var buffer = self.unwrapInboundIn(data)
+                        self.bytes.writeBuffer(&buffer)
+                        // Refuse whatever came, so a client that sent its login fails instead of waiting forever.
+                        var packet = MySQLPacket()
+                        packet.payload.writeMultipleIntegers(0xff/*flag*/, 1045/*ER_ACCESS_DENIED_ERROR*/, endianness: .little, as: (UInt8, UInt16).self)
+                        packet.payload.writeString("#28000Access denied")
+                        self.send(packet, context: context)
+                    }
+                    func channelInactive(context: ChannelHandlerContext) {
+                        self.received.succeed(self.bytes)
+                    }
+                    func send(_ packet: MySQLPacket, context: ChannelHandlerContext) {
+                        var buffer = ByteBuffer()
+                        try! MySQLPacketEncoder(sequence: .init(), logger: .init(label: "") { _ in SwiftLogNoOpLogHandler() }).encode(data: packet, out: &buffer) // Never actually throws
+                        context.writeAndFlush(self.wrapOutboundOut(buffer), promise: nil)
+                    }
+                }
+                return channel.eventLoop.makeCompletedFuture { try channel.pipeline.syncOperations.addHandler(Handler(received: received)) }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        await #expect(throws: MySQLError.secureConnectionRequired) {
+            let connection = try await MySQLConnection.connect(to: serverChannel.localAddress!, username: "user", database: "", password: "password", tlsConfiguration: .makeClientConfiguration(), on: .singletonMultiThreadedEventLoopGroup.any()).get()
+            try? await connection.close().get() // connection is *only* open if we get to this point
+        }
+        let bytes = try await received.futureResult.get()
+        #expect(bytes.readableBytes == 0 || bytes.readableBytesView.elementsEqual([0x01, 0x00, 0x00, 0x00, 0x01]), "the server got more than a COM_QUIT: \(bytes.hexDump(format: .plain))") // no login
+        try? await serverChannel.close(mode: .all)
+    }
 }
 
 final class MySQLNIOXCTests: XCTestCase {

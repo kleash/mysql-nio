@@ -17,14 +17,23 @@ extension MySQLConnection {
         }
         var tls = TLSConfiguration.makeClientConfiguration()
         tls.certificateVerification = .none
-        return self.connect(
-            to: addr,
-            username: env("MYSQL_USERNAME") ?? "test_username",
-            database: env("MYSQL_DATABASE") ?? "test_database",
-            password: env("MYSQL_PASSWORD") ?? "test_password",
-            tlsConfiguration: tls,
-            on: eventLoop
-        )
+        let connect: @Sendable (TLSConfiguration?) -> EventLoopFuture<MySQLConnection> = { tls in
+            self.connect(
+                to: addr,
+                username: env("MYSQL_USERNAME") ?? "test_username",
+                database: env("MYSQL_DATABASE") ?? "test_database",
+                password: env("MYSQL_PASSWORD") ?? "test_password",
+                tlsConfiguration: tls,
+                on: eventLoop
+            )
+        }
+        // Test servers without TLS (CI's insecure job, stock MariaDB images) are tested in plaintext.
+        return connect(tls).flatMapError { error in
+            guard case MySQLError.secureConnectionRequired = error else {
+                return eventLoop.makeFailedFuture(error)
+            }
+            return connect(nil)
+        }
     }
 
     static func test() async throws -> MySQLConnection {
